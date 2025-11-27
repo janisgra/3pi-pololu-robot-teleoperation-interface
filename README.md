@@ -11,7 +11,7 @@ WiFi teleoperation interface for the Pololu 3pi+ 32U4 OLED robot using an ESP32 
 
 ---
 
-## ⚠️ Important Notice
+## Important Notice
 
 **The OLED display will NOT work when using WiFi teleoperation.**
 
