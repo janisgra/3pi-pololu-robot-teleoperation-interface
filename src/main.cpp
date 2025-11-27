@@ -224,7 +224,11 @@ void updatePositionFromEncoders() {
 }
 
 void resetPosition() {
-    position = {0, 0, 0, encoders.getCountsLeft(), encoders.getCountsRight()};
+    position.x = 0;
+    position.y = 0;
+    position.heading = 0;
+    position.lastEncLeft = encoders.getCountsLeft();
+    position.lastEncRight = encoders.getCountsRight();
     lastImuUpdate = 0;
 }
 
