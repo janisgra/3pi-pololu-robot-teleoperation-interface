@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Pololu 3pi+ Robot - UDP Teleoperation Controller
 
