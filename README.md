@@ -164,6 +164,8 @@ All communication uses JSON over UDP (port 5005).
 | Get Status | `{"cmd":"status"}` |
 | LED | `{"cmd":"led","red":true,"yellow":false,"green":true}` |
 | Buzzer | `{"cmd":"buzzer","frequency":440,"duration":200}` |
+| Ping (E2E) | `{"cmd":"ping","seq":1,"ts":0}` |
+| Bridge Ping | `{"cmd":"bridge_ping","seq":1,"ts":0}` |
 
 ### Responses (Robot → Controller)
 
@@ -175,8 +177,33 @@ All communication uses JSON over UDP (port 5005).
 | Status | `{"type":"status","battery":4200,"enc":[500,500],"bump":[0,0],"mtr":[0,0],"ts":12345}` |
 | Event | `{"type":"event","event":"bump","side":"left","ts":12345}` |
 | Error | `{"type":"error","error":"unknown_cmd","ts":12345}` |
+| Pong (E2E) | `{"type":"pong","seq":1,"client_ts":0,"robot_ts":12345}` |
+| Bridge Pong | `{"type":"bridge_pong","seq":1,"client_ts":0,"bridge_ts":54321}` |
 
 See `docs/message-format-definition.md` for the complete protocol specification.
+
+## Latency Benchmarking
+
+The system supports two levels of latency measurement:
+
+| Target | Command | Measures |
+|--------|---------|----------|
+| Bridge only | `bridge_ping` | Desktop -> ESP32 WiFi UDP round-trip |
+| End-to-end | `ping` | Desktop -> ESP32 -> Robot UART -> ESP32 -> Desktop |
+
+From the desktop UI (Pololu Robot section), click **Ping Bridge** or **Ping Robot (E2E)** to measure single-shot latency, or **Run Bench (10x E2E)** for a statistical summary (min/avg/max).
+
+Programmatic usage from C++:
+
+```cpp
+auto bridge = sender.pingBridge(200);   // 200ms timeout
+auto e2e    = sender.pingRobot(500);    // 500ms timeout
+auto bench  = sender.runLatencyBench(10, false, 500);
+```
+
+Expected latencies on a local WiFi network:
+- Bridge ping: 2-10 ms (WiFi UDP only)
+- End-to-end: 5-25 ms (WiFi + UART at 115200 baud)
 
 ## Project Structure
 
