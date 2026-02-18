@@ -511,6 +511,18 @@ void processCommand(const char* json) {
         motors.setSpeeds(0, 0);
         sendAck("calibrate");
     }
+    else if (strcmp(cmd, "ping") == 0) {
+        // Latency benchmarking: echo back with robot-side timestamp
+        uint32_t seq = parseIntValue(json, "\"seq\"");
+        uint32_t clientTs = parseIntValue(json, "\"ts\"");
+        espSerial.print(F("{\"type\":\"pong\",\"seq\":"));
+        espSerial.print(seq);
+        espSerial.print(F(",\"client_ts\":"));
+        espSerial.print(clientTs);
+        espSerial.print(F(",\"robot_ts\":"));
+        espSerial.print(millis());
+        espSerial.println(F("}"));
+    }
     else sendError("unknown_cmd");
 }
 

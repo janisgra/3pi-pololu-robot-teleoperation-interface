@@ -135,6 +135,29 @@ Calibrate line sensors (robot will spin).
 {"cmd": "calibrate", "sensor": "line"}
 ```
 
+### ping
+
+End-to-end latency measurement. The command traverses desktop -> ESP32 bridge -> robot UART and back. The robot echoes with a `pong` response including its local timestamp.
+
+```json
+{"cmd": "ping", "seq": 1, "ts": 1708200000000}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| seq | int | Sequence number (for matching responses) |
+| ts | int | Client-side timestamp in ms (epoch or monotonic) |
+
+### bridge_ping
+
+Bridge-only latency measurement. Handled entirely by the ESP32 bridge; not forwarded to the robot. Useful for isolating WiFi/UDP latency from UART latency.
+
+```json
+{"cmd": "bridge_ping", "seq": 1, "ts": 1708200000000}
+```
+
+Same fields as `ping`.
+
 ---
 
 ## Responses (Robot → Controller)
@@ -259,6 +282,34 @@ Error response.
 ```
 
 Error codes: `no_cmd`, `unknown_cmd`, `no_dir`, `bad_dir`, `no_dist_dur`
+
+### pong
+
+End-to-end ping response from the robot.
+
+```json
+{"type": "pong", "seq": 1, "client_ts": 1708200000000, "robot_ts": 12345}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| seq | int | Echoed sequence number |
+| client_ts | int | Echoed client timestamp |
+| robot_ts | int | Robot-side millis() at time of response |
+
+### bridge_pong
+
+Bridge-only ping response from the ESP32.
+
+```json
+{"type": "bridge_pong", "seq": 1, "client_ts": 1708200000000, "bridge_ts": 54321}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| seq | int | Echoed sequence number |
+| client_ts | int | Echoed client timestamp |
+| bridge_ts | int | ESP32-side millis() at time of response |
 
 ---
 
