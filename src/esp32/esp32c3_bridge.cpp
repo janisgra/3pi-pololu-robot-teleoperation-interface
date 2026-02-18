@@ -123,6 +123,30 @@ void handleUDP() {
     rxCount++;
     
     Serial.printf("[UDP RX] %s:%d -> %s\n", lastClientIP.toString().c_str(), lastClientPort, udpBuffer);
+
+    // Check if this is a bridge-level ping (does not forward to robot)
+    if (strstr(udpBuffer, "\"cmd\":\"bridge_ping\"") != nullptr) {
+        JsonDocument pingDoc;
+        DeserializationError err = deserializeJson(pingDoc, udpBuffer);
+        uint32_t seq = 0;
+        uint32_t clientTs = 0;
+        if (!err) {
+            seq = pingDoc["seq"] | 0;
+            clientTs = pingDoc["ts"] | 0;
+        }
+        JsonDocument pongDoc;
+        pongDoc["type"] = "bridge_pong";
+        pongDoc["seq"] = seq;
+        pongDoc["client_ts"] = clientTs;
+        pongDoc["bridge_ts"] = millis();
+        String pong;
+        serializeJson(pongDoc, pong);
+        udp.beginPacket(lastClientIP, lastClientPort);
+        udp.print(pong);
+        udp.endPacket();
+        return;
+    }
+
     Serial1.println(udpBuffer);
     
     setLED(false);
