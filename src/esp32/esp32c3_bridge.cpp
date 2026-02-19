@@ -31,6 +31,9 @@
 
 // UDP Configuration
 #define UDP_PORT                5005
+#define DISCOVERY_PORT          5004    // Broadcast beacon port for auto-discovery
+#define DISCOVERY_INTERVAL_MS   2000    // Beacon interval when no client connected
+#define DISCOVERY_SLOW_MS       10000   // Beacon interval when client is active
 
 // Pin Configuration (ESP32-C3 SuperMini)
 #define ROBOT_RX_PIN            5       // GPIO5 <- 3pi+ Pin 0 (TX1)
@@ -54,6 +57,7 @@
 // ============================================================================
 
 WiFiUDP udp;
+WiFiUDP discoveryUdp;                   // Separate socket for discovery beacons
 IPAddress lastClientIP;
 uint16_t lastClientPort = 0;
 
@@ -63,6 +67,7 @@ String serialBuffer;
 uint32_t lastHeartbeat = 0;
 uint32_t lastStatusPrint = 0;
 uint32_t lastWiFiCheck = 0;
+uint32_t lastDiscoveryBeacon = 0;
 uint32_t rxCount = 0;
 uint32_t txCount = 0;
 
@@ -103,6 +108,87 @@ void sendHeartbeat() {
     udp.beginPacket(lastClientIP, lastClientPort);
     udp.print(output);
     udp.endPacket();
+}
+
+// ============================================================================
+// DISCOVERY PROTOCOL
+// ============================================================================
+
+/**
+ * Broadcast a discovery beacon on the subnet broadcast address.
+ * Any client listening on DISCOVERY_PORT can find this bridge
+ * without knowing its IP in advance.
+ */
+void broadcastDiscovery() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    JsonDocument doc;
+    doc["type"]    = "discovery";
+    doc["service"] = "pololu-3pi-bridge";
+    doc["ip"]      = WiFi.localIP().toString();
+    doc["port"]    = UDP_PORT;
+    doc["mac"]     = WiFi.macAddress();
+    doc["board"]   = "ESP32-C3";
+    doc["rssi"]    = WiFi.RSSI();
+    doc["uptime"]  = millis() / 1000;
+
+    String output;
+    serializeJson(doc, output);
+
+    // /24 subnet broadcast
+    IPAddress bcast = WiFi.localIP();
+    bcast[3] = 255;
+
+    discoveryUdp.beginPacket(bcast, DISCOVERY_PORT);
+    discoveryUdp.print(output);
+    discoveryUdp.endPacket();
+
+    Serial.printf("[Discovery] Beacon -> %s:%d\n",
+                  bcast.toString().c_str(), DISCOVERY_PORT);
+}
+
+/**
+ * Handle incoming packets on the discovery port.
+ * If a client sends {"cmd":"discover_ack"} we log the client and reply
+ * with {"type":"discover_confirm",...} so the handshake completes.
+ */
+void handleDiscoveryResponse() {
+    int packetSize = discoveryUdp.parsePacket();
+    if (packetSize <= 0) return;
+
+    char buf[256];
+    int len = discoveryUdp.read(buf, sizeof(buf) - 1);
+    if (len <= 0) return;
+    buf[len] = '\0';
+
+    IPAddress remoteIP   = discoveryUdp.remoteIP();
+    uint16_t  remotePort = discoveryUdp.remotePort();
+
+    Serial.printf("[Discovery] RX from %s:%d -> %s\n",
+                  remoteIP.toString().c_str(), remotePort, buf);
+
+    if (strstr(buf, "\"cmd\":\"discover_ack\"") != nullptr) {
+        lastClientIP = remoteIP;
+        // lastClientPort is set when the client actually sends on the data port
+
+        // Confirm discovery to the client
+        JsonDocument ack;
+        ack["type"]  = "discover_confirm";
+        ack["ip"]    = WiFi.localIP().toString();
+        ack["port"]  = UDP_PORT;
+        ack["mac"]   = WiFi.macAddress();
+        ack["board"] = "ESP32-C3";
+
+        String ackOut;
+        serializeJson(ack, ackOut);
+
+        discoveryUdp.beginPacket(remoteIP, remotePort);
+        discoveryUdp.print(ackOut);
+        discoveryUdp.endPacket();
+
+        Serial.printf("[Discovery] Client confirmed: %s\n",
+                      remoteIP.toString().c_str());
+    }
 }
 
 // ============================================================================
@@ -233,6 +319,9 @@ void setup() {
     
     udp.begin(UDP_PORT);
     Serial.printf("UDP listening on port %d\n", UDP_PORT);
+
+    discoveryUdp.begin(DISCOVERY_PORT);
+    Serial.printf("Discovery beacon on port %d\n", DISCOVERY_PORT);
     
     blinkLED(3, 100);
     setLED(true);
@@ -250,7 +339,16 @@ void loop() {
     
     handleUDP();
     handleSerial();
-    
+
+    // Discovery beacon -- broadcasts faster when no client, slower when active
+    uint32_t discoveryInterval = (lastClientPort > 0)
+        ? DISCOVERY_SLOW_MS : DISCOVERY_INTERVAL_MS;
+    if (now - lastDiscoveryBeacon >= discoveryInterval) {
+        broadcastDiscovery();
+        lastDiscoveryBeacon = now;
+    }
+    handleDiscoveryResponse();
+
     // Heartbeat
     if (lastClientPort > 0 && now - lastHeartbeat >= BRIDGE_HEARTBEAT_MS) {
         sendHeartbeat();
