@@ -84,9 +84,59 @@ class PatternConfig:
     # Tape
     tape_width: float = 25.0          # mm
 
+    # Clearance
+    return_clearance: float = 100.0   # mm centre-to-centre between return corridor and nearest arc tape
+
+    # Corner fiducials
+    corner_square: float = 100.0       # mm; black square at each board corner
+    aruco_cell: float = 10.0           # mm; cell size for ArUco markers (6x6 grid = 60 mm)
+    aruco_ids: tuple = (0, 1, 2, 3)    # DICT_4X4_50 IDs for TL, TR, BL, BR corners
+
     # Options
     exterior_return: bool = True      # close the loop via exterior (no crossing)
     closed_loop: bool = True          # connect end back to start
+
+
+# ============================================================================
+# ARUCO MARKER DATA (DICT_4X4_50, IDs 0-3)
+# ============================================================================
+
+# Each entry is a 6x6 grid (1-cell black border + 4x4 data).
+# 1 = black, 0 = white.  Verified against OpenCV cv2.aruco.DICT_4X4_50.
+ARUCO_4X4_50 = {
+    0: [
+        [1, 1, 1, 1, 1, 1],
+        [1, 0, 1, 0, 0, 1],
+        [1, 1, 0, 1, 0, 1],
+        [1, 1, 1, 0, 0, 1],
+        [1, 1, 1, 0, 1, 1],
+        [1, 1, 1, 1, 1, 1],
+    ],
+    1: [
+        [1, 1, 1, 1, 1, 1],
+        [1, 1, 1, 1, 1, 1],
+        [1, 0, 0, 0, 0, 1],
+        [1, 0, 1, 1, 0, 1],
+        [1, 0, 1, 0, 1, 1],
+        [1, 1, 1, 1, 1, 1],
+    ],
+    2: [
+        [1, 1, 1, 1, 1, 1],
+        [1, 1, 1, 0, 0, 1],
+        [1, 1, 1, 0, 0, 1],
+        [1, 1, 1, 0, 1, 1],
+        [1, 0, 0, 1, 0, 1],
+        [1, 1, 1, 1, 1, 1],
+    ],
+    3: [
+        [1, 1, 1, 1, 1, 1],
+        [1, 0, 1, 1, 0, 1],
+        [1, 0, 1, 1, 0, 1],
+        [1, 1, 0, 1, 1, 1],
+        [1, 1, 0, 0, 1, 1],
+        [1, 1, 1, 1, 1, 1],
+    ],
+}
 
 
 # ============================================================================
@@ -114,16 +164,22 @@ def generate_serpentine(cfg: PatternConfig) -> Tuple[np.ndarray, dict]:
     r = min(cfg.corner_radius, cfg.track_spacing / 2.0)
 
     # Usable area -- when the exterior return is enabled the serpentine
-    # is inset so that arcs + tape clear the return corridor whose
-    # centreline sits at cfg.margin from each board edge.
-    # The gap between return-tape edge and arc-tape edge equals one
-    # tape_width (the "2 *" accounts for both paths' half-widths
-    # plus one full tape-width clearance).
+    # is inset so that arcs + tape don't overlap the return corridor
+    # whose centreline sits at cfg.margin from each board edge.
+    #   LEFT (return-path side):
+    #     return_clearance is the centre-to-centre distance between the
+    #     return corridor (at cfg.margin) and the leftmost arc tape
+    #     centreline.  Edge-to-edge = return_clearance - tape_width.
+    #   RIGHT (far side):
+    #     The arc outer tape edge touches the margin line exactly
+    #     (distance from margin to arc centreline = tape_width / 2).
+    #   y: tape_width / 2 puts the first/last track tape edge exactly
+    #      on the margin line.
     if cfg.exterior_return:
-        x_min = cfg.margin + 2 * cfg.tape_width + r
-        x_max = cfg.board_width - cfg.margin - 2 * cfg.tape_width - r
-        y_min = cfg.margin + 2 * cfg.tape_width
-        y_max = cfg.board_depth - cfg.margin - 2 * cfg.tape_width
+        x_min = cfg.margin + cfg.return_clearance + r
+        x_max = cfg.board_width - cfg.margin - r - cfg.tape_width / 2.0
+        y_min = cfg.margin + cfg.tape_width / 2.0
+        y_max = cfg.board_depth - cfg.margin - cfg.tape_width / 2.0
     else:
         x_min = cfg.margin
         x_max = cfg.board_width - cfg.margin
@@ -142,12 +198,20 @@ def generate_serpentine(cfg: PatternConfig) -> Tuple[np.ndarray, dict]:
         n_passes -= 1
         actual_span = (n_passes - 1) * cfg.track_spacing
 
-    # Centre vertically
-    y_offset = y_min + (usable_d - actual_span) / 2.0
+    # Bottom-justify: first track sits at y_min so it is as close to
+    # the return corridor as geometry allows (no wasted centering gap).
+    y_offset = y_min
 
     points: List[Tuple[float, float]] = []
     markers: List[dict] = []           # sync-marker positions
     direction = 1  # 1 = left-to-right, -1 = right-to-left
+
+    # When using exterior return, start at the bottom-arc exit point
+    # so the closed loop joins seamlessly without backtracking.
+    if cfg.exterior_return:
+        points.append((cfg.margin + r, y_min))
+
+    first_track_y = y_offset  # Y of the first serpentine track
 
     for i in range(n_passes):
         y = y_offset + i * cfg.track_spacing
@@ -180,9 +244,9 @@ def generate_serpentine(cfg: PatternConfig) -> Tuple[np.ndarray, dict]:
                 markers.append({"x": x_min, "y": y, "angle_deg": 90.0})
                 markers.append({"x": x_min, "y": y_next, "angle_deg": 90.0})
                 arc = _semicircle_points(cx, y_mid, r,
-                                         start_angle=math.pi / 2,
+                                         start_angle=-math.pi / 2,
                                          sweep=math.pi,
-                                         clockwise=False,
+                                         clockwise=True,
                                          n=cfg.arc_resolution)
             points.extend(arc)
 
@@ -193,31 +257,78 @@ def generate_serpentine(cfg: PatternConfig) -> Tuple[np.ndarray, dict]:
         end = points[-1]
         start = points[0]
         if abs(end[0] - start[0]) > 1.0 or abs(end[1] - start[1]) > 1.0:
-            # Route along the board perimeter from end back to start.
-            # The exterior corridor centreline sits at cfg.margin from
-            # the board edge -- well clear of the inset serpentine.
-            ext = cfg.margin  # corridor centreline offset from board edge
-
+            ext = cfg.margin
             ex, ey = end
             sx, sy = start
+            ret_r = r  # reuse corner radius for return-path arcs
+            n_quarter = max(cfg.arc_resolution // 2, 5)
 
-            route: List[Tuple[float, float]] = []
-
-            # Move horizontally to the nearest exterior corridor
             if ex > cfg.board_width / 2.0:
                 corr_x = cfg.board_width - ext
             else:
                 corr_x = ext
-            route.append((corr_x, ey))
 
-            # Travel down to the bottom corridor
-            route.append((corr_x, ext))
+            route: List[Tuple[float, float]] = []
 
-            # Move along the bottom corridor to beneath the start
-            route.append((sx, ext))
+            if abs(corr_x - sx) < 1.0 or abs(corr_x - (sx - r)) < 1.0:
+                # Same vertical corridor -- round both corners.
+                going_left = (ex > corr_x)
+                going_up = (ey > sy)
+                sign_x = 1 if going_left else -1
+                sign_y = -1 if going_up else 1
 
-            # Rise up to the start point
-            route.append((sx, sy))
+                # ---- Corner 1: horizontal-to-vertical ----
+                c1x = corr_x + sign_x * ret_r
+                c1y = ey + sign_y * ret_r
+                route.append((c1x, ey))  # approach
+                markers.append({"x": c1x, "y": ey, "angle_deg": 90.0})
+                if going_left and going_up:
+                    sa1, cw1 = math.pi / 2, False
+                elif going_left and not going_up:
+                    sa1, cw1 = -math.pi / 2, False
+                elif not going_left and going_up:
+                    sa1, cw1 = math.pi / 2, True
+                else:
+                    sa1, cw1 = -math.pi / 2, True
+                arc1 = _semicircle_points(c1x, c1y, ret_r,
+                                          start_angle=sa1,
+                                          sweep=math.pi / 2,
+                                          clockwise=cw1,
+                                          n=n_quarter)
+                route.extend(arc1)
+                markers.append({"x": corr_x, "y": c1y, "angle_deg": 0.0})
+
+                # ---- Corner 2: vertical-to-horizontal ----
+                c2x = corr_x + sign_x * ret_r
+                c2y = sy - sign_y * ret_r
+                route.append((corr_x, c2y))  # corridor approach
+                markers.append({"x": corr_x, "y": c2y, "angle_deg": 0.0})
+                if going_up and going_left:
+                    sa2, cw2 = math.pi, False
+                elif not going_up and going_left:
+                    sa2, cw2 = math.pi, True
+                elif going_up and not going_left:
+                    sa2, cw2 = 0.0, True
+                else:
+                    sa2, cw2 = 0.0, False
+                arc2 = _semicircle_points(c2x, c2y, ret_r,
+                                          start_angle=sa2,
+                                          sweep=math.pi / 2,
+                                          clockwise=cw2,
+                                          n=n_quarter)
+                route.extend(arc2)
+                markers.append({"x": c2x, "y": sy, "angle_deg": 90.0})
+
+                # Close to start (skip if arc exit matches start)
+                if abs(route[-1][0] - sx) > 0.5 or abs(route[-1][1] - sy) > 0.5:
+                    route.append((sx, sy))
+            else:
+                # Different corridor -- route via edge (sharp corners)
+                route.append((corr_x, ey))
+                route.append((corr_x, ext))
+                route.append((sx, ext))
+                if abs(route[-1][0] - sx) > 0.5 or abs(route[-1][1] - sy) > 0.5:
+                    route.append((sx, sy))
 
             points.extend(route)
 
@@ -255,6 +366,8 @@ def generate_serpentine(cfg: PatternConfig) -> Tuple[np.ndarray, dict]:
         "markers": markers,
         "n_markers": len(markers),
         "corner_radius_mm": round(r, 1),
+        "first_track_y": first_track_y,
+        "start_to_first_marker_mm": round(markers[0]["x"] - path[0, 0], 1) if markers else 0.0,
     }
 
     return path, stats
@@ -346,6 +459,14 @@ def export_svg(path: np.ndarray, cfg: PatternConfig, filename: str,
         'refX="0" refY="3" orient="auto">',
         '      <path d="M8,0 L0,3 L8,6" fill="#2266cc"/>',
         '    </marker>',
+        '    <marker id="arr-green" markerWidth="8" markerHeight="6" '
+        'refX="8" refY="3" orient="auto">',
+        '      <path d="M0,0 L8,3 L0,6" fill="#22aa44"/>',
+        '    </marker>',
+        '    <marker id="arr-green-rev" markerWidth="8" markerHeight="6" '
+        'refX="0" refY="3" orient="auto">',
+        '      <path d="M8,0 L0,3 L8,6" fill="#22aa44"/>',
+        '    </marker>',
         '  </defs>',
         # Board outline
         f'  <rect x="0" y="0" width="{w}" height="{h}" '
@@ -355,6 +476,41 @@ def export_svg(path: np.ndarray, cfg: PatternConfig, filename: str,
         f'width="{w - 2 * cfg.margin}" height="{h - 2 * cfg.margin}" '
         f'fill="none" stroke="#ccc" stroke-width="0.5" stroke-dasharray="5,5"/>',
     ]
+
+    # --- Corner fiducials (black squares + ArUco markers) ---
+    cs = cfg.corner_square
+    cell = cfg.aruco_cell
+    aruco_size = 6 * cell  # 60 mm for 6x6 grid
+    pad = (cs - aruco_size) / 2.0  # centring offset
+    # (black_x, black_y, aruco_origin_x, aruco_origin_y, aruco_id)
+    corners_fid = [
+        (0, 0, pad, pad, cfg.aruco_ids[0]),                                  # TL
+        (w - cs, 0, w - cs + pad, pad, cfg.aruco_ids[1]),                    # TR
+        (0, h - cs, pad, h - cs + pad, cfg.aruco_ids[2]),                    # BL
+        (w - cs, h - cs, w - cs + pad, h - cs + pad, cfg.aruco_ids[3]),      # BR
+    ]
+    for bx, by, ax_orig, ay_orig, aid in corners_fid:
+        # Black square
+        svg_lines.append(
+            f'  <rect x="{bx}" y="{by}" width="{cs}" height="{cs}" '
+            f'fill="black"/>'
+        )
+        # White background for ArUco readability
+        svg_lines.append(
+            f'  <rect x="{ax_orig}" y="{ay_orig}" '
+            f'width="{aruco_size}" height="{aruco_size}" fill="white"/>'
+        )
+        # ArUco cells
+        grid = ARUCO_4X4_50.get(aid, ARUCO_4X4_50[0])
+        for row_i, row in enumerate(grid):
+            for col_i, val in enumerate(row):
+                if val == 1:  # black cell
+                    cx = ax_orig + col_i * cell
+                    cy = ay_orig + row_i * cell
+                    svg_lines.append(
+                        f'  <rect x="{cx:.1f}" y="{cy:.1f}" '
+                        f'width="{cell}" height="{cell}" fill="black"/>'
+                    )
 
     # --- Main path as polyline ---
     pts_str = " ".join(f"{p[0]:.1f},{p[1]:.1f}" for p in path)
@@ -379,7 +535,7 @@ def export_svg(path: np.ndarray, cfg: PatternConfig, filename: str,
         )
 
     # --- Spacing indicator (between first two tracks, left side) ---
-    y_first = path[0, 1]  # first track Y
+    y_first = stats["first_track_y"] if stats else path[0, 1]
     if len(markers) >= 1:
         dim_x = max(path[0, 0] - 30.0, 10.0)
         y1 = y_first
@@ -442,6 +598,62 @@ def export_svg(path: np.ndarray, cfg: PatternConfig, filename: str,
     svg_lines.append(
         f'  <circle cx="{path[-1, 0]:.1f}" cy="{path[-1, 1]:.1f}" '
         f'r="10" fill="red" opacity="0.7"/>'
+    )
+
+    # --- Start-to-first-marker dimension (horizontal, above first track) ---
+    s2m_dist = stats.get("start_to_first_marker_mm", 0) if stats else 0
+    if s2m_dist > 0 and markers:
+        s2m_track_y = stats.get("first_track_y", path[0, 1]) if stats else path[0, 1]
+        dim_y = s2m_track_y - cfg.tape_width - 15
+        start_x = path[0, 0]
+        marker_x = markers[0]["x"]
+        svg_lines.append(
+            f'  <line x1="{start_x:.1f}" y1="{dim_y:.1f}" '
+            f'x2="{marker_x:.1f}" y2="{dim_y:.1f}" '
+            f'stroke="#22aa44" stroke-width="1.5" '
+            f'marker-start="url(#arr-green-rev)" marker-end="url(#arr-green)"/>'
+        )
+        svg_lines.append(
+            f'  <line x1="{start_x:.1f}" y1="{dim_y - 8:.1f}" '
+            f'x2="{start_x:.1f}" y2="{dim_y + 8:.1f}" '
+            f'stroke="#22aa44" stroke-width="1"/>'
+        )
+        svg_lines.append(
+            f'  <line x1="{marker_x:.1f}" y1="{dim_y - 8:.1f}" '
+            f'x2="{marker_x:.1f}" y2="{dim_y + 8:.1f}" '
+            f'stroke="#22aa44" stroke-width="1"/>'
+        )
+        mid_x = (start_x + marker_x) / 2.0
+        svg_lines.append(
+            f'  <text x="{mid_x:.1f}" y="{dim_y - 10:.1f}" '
+            f'text-anchor="middle" font-size="16" fill="#22aa44">'
+            f'start to 1st marker: {s2m_dist:.0f} mm</text>'
+        )
+
+    # --- Margin indicator (bottom edge, from board edge to margin line) ---
+    margin_dim_y = h - cfg.margin / 2.0  # place below the margin line
+    margin_dim_x1 = w / 2.0 - 60.0      # centred-ish span
+    svg_lines.append(
+        f'  <line x1="{margin_dim_x1:.1f}" y1="{h:.1f}" '
+        f'x2="{margin_dim_x1:.1f}" y2="{h - cfg.margin:.1f}" '
+        f'stroke="#cc6622" stroke-width="1.5" '
+        f'marker-start="url(#arr-rev)" marker-end="url(#arr)"/>'
+    )
+    # Tick marks
+    svg_lines.append(
+        f'  <line x1="{margin_dim_x1 - 10:.1f}" y1="{h:.1f}" '
+        f'x2="{margin_dim_x1 + 10:.1f}" y2="{h:.1f}" '
+        f'stroke="#cc6622" stroke-width="1"/>'
+    )
+    svg_lines.append(
+        f'  <line x1="{margin_dim_x1 - 10:.1f}" y1="{h - cfg.margin:.1f}" '
+        f'x2="{margin_dim_x1 + 10:.1f}" y2="{h - cfg.margin:.1f}" '
+        f'stroke="#cc6622" stroke-width="1"/>'
+    )
+    svg_lines.append(
+        f'  <text x="{margin_dim_x1 + 16:.1f}" y="{h - cfg.margin / 2.0:.1f}" '
+        f'text-anchor="start" font-size="16" fill="#cc6622">'
+        f'margin {cfg.margin:.0f} mm</text>'
     )
 
     # --- Board dimension labels ---
@@ -512,6 +724,36 @@ def plot_pattern(path: np.ndarray, cfg: PatternConfig, stats: dict):
     )
     ax.add_patch(margin_rect)
 
+    # --- Corner fiducials (black squares + ArUco markers) ---
+    cs = cfg.corner_square
+    cell = cfg.aruco_cell
+    aruco_size = 6 * cell
+    pad = (cs - aruco_size) / 2.0
+    corners_fid = [
+        (0, 0, pad, pad, cfg.aruco_ids[0]),
+        (cfg.board_width - cs, 0, cfg.board_width - cs + pad, pad, cfg.aruco_ids[1]),
+        (0, cfg.board_depth - cs, pad, cfg.board_depth - cs + pad, cfg.aruco_ids[2]),
+        (cfg.board_width - cs, cfg.board_depth - cs,
+         cfg.board_width - cs + pad, cfg.board_depth - cs + pad, cfg.aruco_ids[3]),
+    ]
+    for bx, by, ax_orig, ay_orig, aid in corners_fid:
+        ax.add_patch(mpatches.Rectangle(
+            (bx, by), cs, cs, facecolor='black', edgecolor='none'))
+        # White background
+        ax.add_patch(mpatches.Rectangle(
+            (ax_orig, ay_orig), aruco_size, aruco_size,
+            facecolor='white', edgecolor='none'))
+        # ArUco cells
+        grid = ARUCO_4X4_50.get(aid, ARUCO_4X4_50[0])
+        for row_i, row in enumerate(grid):
+            for col_i, val in enumerate(row):
+                if val == 1:
+                    ax.add_patch(mpatches.Rectangle(
+                        (ax_orig + col_i * cell,
+                         ay_orig + row_i * cell),
+                        cell, cell,
+                        facecolor='black', edgecolor='none'))
+
     # Path with tape width
     ax.plot(path[:, 0], path[:, 1], 'k-', linewidth=cfg.tape_width / 10,
             solid_capstyle='round', solid_joinstyle='round', label='Tape path')
@@ -550,7 +792,7 @@ def plot_pattern(path: np.ndarray, cfg: PatternConfig, stats: dict):
                                         lw=1.5))
 
     # --- Spacing indicator (blue dimension line between first two tracks) ---
-    y0 = path[0, 1]
+    y0 = stats.get("first_track_y", path[0, 1])
     y1_dim = y0 + cfg.track_spacing
     dim_x = max(path[0, 0] - 30.0, 10.0)
     ax.annotate('', xy=(dim_x, y1_dim), xytext=(dim_x, y0),
@@ -559,6 +801,17 @@ def plot_pattern(path: np.ndarray, cfg: PatternConfig, stats: dict):
             f'{cfg.track_spacing:.0f} mm',
             ha='center', va='center', fontsize=8, color='#2266cc',
             rotation=90, fontweight='bold',
+            bbox=dict(facecolor='white', edgecolor='none', pad=1))
+
+    # --- Margin indicator (orange dimension, bottom edge) ---
+    margin_dim_x = cfg.board_width / 2.0 - 60.0
+    ax.annotate('', xy=(margin_dim_x, cfg.board_depth),
+                xytext=(margin_dim_x, cfg.board_depth - cfg.margin),
+                arrowprops=dict(arrowstyle='<->', color='#cc6622', lw=1.5))
+    ax.text(margin_dim_x + 14, cfg.board_depth - cfg.margin / 2.0,
+            f'margin {cfg.margin:.0f} mm',
+            ha='left', va='center', fontsize=8, color='#cc6622',
+            fontweight='bold',
             bbox=dict(facecolor='white', edgecolor='none', pad=1))
 
     # --- Radius indicator (blue, at first right-side U-turn) ---
@@ -573,6 +826,20 @@ def plot_pattern(path: np.ndarray, cfg: PatternConfig, stats: dict):
             ha='center', va='center', fontsize=8, color='#2266cc',
             fontweight='bold',
             bbox=dict(facecolor='white', edgecolor='none', pad=1))
+
+    # --- Start-to-first-marker dimension (green, horizontal) ---
+    s2m = stats.get("start_to_first_marker_mm", 0)
+    if s2m > 0 and stats.get("markers"):
+        s2m_y = y0 - cfg.tape_width - 15
+        start_x = path[0, 0]
+        marker_x = stats["markers"][0]["x"]
+        ax.annotate('', xy=(marker_x, s2m_y), xytext=(start_x, s2m_y),
+                    arrowprops=dict(arrowstyle='<->', color='#22aa44', lw=1.5))
+        ax.text((start_x + marker_x) / 2.0, s2m_y - 8,
+                f'start to 1st marker: {s2m:.0f} mm',
+                ha='center', va='center', fontsize=8, color='#22aa44',
+                fontweight='bold',
+                bbox=dict(facecolor='white', edgecolor='none', pad=1))
 
     ax.set_xlim(-20, cfg.board_width + 20)
     ax.set_ylim(-20, cfg.board_depth + 20)
@@ -625,7 +892,7 @@ def main():
     parser.add_argument('--board-depth', type=float, default=800.0,
                         help='Board depth in mm (default: 800)')
     parser.add_argument('--margin', type=float, default=100.0,
-                        help='Margin from board edge in mm (default: 150)')
+                        help='Margin from board edge in mm (default: 100)')
 
     # Pattern
     parser.add_argument('--spacing', type=float, default=100.0,
@@ -636,6 +903,8 @@ def main():
                         help='Sync marker distance before turn in mm (default: 60)')
     parser.add_argument('--no-return', action='store_true',
                         help='Omit exterior return path')
+    parser.add_argument('--return-clearance', type=float, default=100.0,
+                        help='Centre-to-centre distance between return corridor and nearest arc (default: 100)')
 
     # Tape
     parser.add_argument('--tape-width', type=float, default=25.0,
@@ -661,6 +930,7 @@ def main():
         corner_radius=args.corner_radius,
         marker_offset=args.marker_offset,
         tape_width=args.tape_width,
+        return_clearance=args.return_clearance,
         exterior_return=not args.no_return,
     )
 
@@ -684,6 +954,9 @@ def main():
     print(f"  Coverage:        {stats['coverage_pct']:.1f}%")
     print(f"  Exterior return: {'yes' if stats['has_exterior_return'] else 'no'}")
     print(f"  Sync markers:    {stats['n_markers']}")
+    print(f"  Return clearance:{cfg.return_clearance:.0f} mm")
+    if stats.get('start_to_first_marker_mm'):
+        print(f"  Start to 1st mk: {stats['start_to_first_marker_mm']:.0f} mm")
     div = stats['direction_diversity_deg']
     print(f"  Direction bins:  {div['occupied_bins']}/{div['total_bins']} "
           f"(30-degree bins with samples)")
