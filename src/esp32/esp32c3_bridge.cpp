@@ -70,6 +70,7 @@ uint32_t lastWiFiCheck = 0;
 uint32_t lastDiscoveryBeacon = 0;
 uint32_t rxCount = 0;
 uint32_t txCount = 0;
+uint32_t lastSerialCharTime = 0;   // for UART buffer-timeout (stale data flush)
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -135,16 +136,20 @@ void broadcastDiscovery() {
     String output;
     serializeJson(doc, output);
 
-    // /24 subnet broadcast
-    IPAddress bcast = WiFi.localIP();
-    bcast[3] = 255;
+    // Compute proper broadcast address from IP and subnet mask
+    IPAddress localIP = WiFi.localIP();
+    IPAddress subnetMask = WiFi.subnetMask();
+    IPAddress bcast;
+    for (int i = 0; i < 4; i++) {
+        bcast[i] = localIP[i] | ~subnetMask[i];
+    }
 
     discoveryUdp.beginPacket(bcast, DISCOVERY_PORT);
     discoveryUdp.print(output);
     discoveryUdp.endPacket();
 
-    Serial.printf("[Discovery] Beacon -> %s:%d\n",
-                  bcast.toString().c_str(), DISCOVERY_PORT);
+    Serial.printf("[Discovery] Beacon -> %s:%d (%d bytes)\n",
+                  bcast.toString().c_str(), DISCOVERY_PORT, output.length());
 }
 
 /**
@@ -210,8 +215,11 @@ void handleUDP() {
     
     Serial.printf("[UDP RX] %s:%d -> %s\n", lastClientIP.toString().c_str(), lastClientPort, udpBuffer);
 
-    // Check if this is a bridge-level ping (does not forward to robot)
-    if (strstr(udpBuffer, "\"cmd\":\"bridge_ping\"") != nullptr) {
+    // Check if this is a bridge-level ping (does not forward to robot).
+    // Python json.dumps adds a space after ':' by default, so we check
+    // for both "cmd":"bridge_ping" and "cmd": "bridge_ping".
+    if (strstr(udpBuffer, "\"bridge_ping\"") != nullptr &&
+        strstr(udpBuffer, "\"cmd\"") != nullptr) {
         JsonDocument pingDoc;
         DeserializationError err = deserializeJson(pingDoc, udpBuffer);
         uint32_t seq = 0;
@@ -245,8 +253,22 @@ void handleUDP() {
 // ============================================================================
 
 void handleSerial() {
+    uint32_t now = millis();
+
+    // Flush stale partial data.  If characters arrived but no newline
+    // followed within 200 ms, the line is almost certainly a corrupt
+    // fragment (e.g. from a loose UART wire).  Discard it so the next
+    // valid message is not concatenated to garbage.
+    if (serialBuffer.length() > 0 && lastSerialCharTime > 0 &&
+        (now - lastSerialCharTime > 200)) {
+        Serial.printf("[UART] Flushing stale buffer (%d B): %s\n",
+                      serialBuffer.length(), serialBuffer.c_str());
+        serialBuffer = "";
+    }
+
     while (Serial1.available()) {
         char c = Serial1.read();
+        lastSerialCharTime = now;
         
         if (c == '\n') {
             if (serialBuffer.length() > 0) {

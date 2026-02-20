@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Serpentine Track Drive Test with Real-Time Visualization
 
@@ -79,6 +78,10 @@ DEFAULT_DRIVE_SPEED_PCT = 50   # % of max motor speed for straight legs
 UTURN_SPEED_PCT = 30           # % for U-turns
 POSITION_POLL_HZ = 10          # how often to request position from robot
 
+# Robot geometry (Pololu 3pi+ 32U4)
+WHEEL_TRACK_MM = 96.0          # approximate distance between wheel centres
+TURN_90_ARC_MM = (WHEEL_TRACK_MM / 2) * (math.pi / 2)  # ~75.4 mm encoder dist
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -111,35 +114,48 @@ def discover_bridge(timeout: float = 5.0) -> Optional[Tuple[str, int]]:
     Returns (ip, data_port) or None.
     """
     logger = logging.getLogger("discovery")
-    logger.info("Listening for discovery beacons on port %d ...", DISCOVERY_PORT)
+    logger.info("Listening for discovery beacons on port %d (%.0fs) ...",
+                DISCOVERY_PORT, timeout)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.settimeout(0.5)
     try:
-        sock.bind(("", DISCOVERY_PORT))
+        # Bind to all interfaces so we receive broadcasts on any subnet
+        sock.bind(("0.0.0.0", DISCOVERY_PORT))
     except OSError as exc:
-        logger.error("Cannot bind port %d: %s", DISCOVERY_PORT, exc)
+        logger.error("Cannot bind port %d: %s  "
+                     "(is another instance running?)", DISCOVERY_PORT, exc)
         sock.close()
         return None
 
     deadline = time.time() + timeout
     result = None
+    packets_received = 0
 
     try:
         while time.time() < deadline:
             try:
                 data, addr = sock.recvfrom(1024)
-                msg = json.loads(data.decode())
+                packets_received += 1
+                raw = data.decode()
+                logger.debug("RX from %s:%d -> %s", addr[0], addr[1],
+                             raw[:200])
+                msg = json.loads(raw)
             except socket.timeout:
                 continue
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                logger.debug("Non-JSON packet from %s: %s", addr, exc)
                 continue
 
             if msg.get("type") != "discovery":
+                logger.debug("Ignoring type=%s from %s",
+                             msg.get("type"), addr[0])
                 continue
             if msg.get("service") != "pololu-3pi-bridge":
+                logger.debug("Ignoring service=%s from %s",
+                             msg.get("service"), addr[0])
                 continue
 
             bridge_ip = msg.get("ip", addr[0])
@@ -151,6 +167,7 @@ def discover_bridge(timeout: float = 5.0) -> Optional[Tuple[str, int]]:
             # Send acknowledgement
             ack = json.dumps({"cmd": "discover_ack"}).encode()
             sock.sendto(ack, addr)
+            logger.debug("Sent discover_ack to %s:%d", *addr)
 
             # Wait briefly for confirmation
             ack_deadline = time.time() + 1.0
@@ -169,6 +186,10 @@ def discover_bridge(timeout: float = 5.0) -> Optional[Tuple[str, int]]:
     finally:
         sock.close()
 
+    if result is None:
+        logger.warning("No beacon received (packets seen: %d). "
+                       "Check that the ESP32 and this PC are on the "
+                       "same WiFi network/subnet.", packets_received)
     return result
 
 
@@ -217,6 +238,11 @@ class SimpleRobotClient:
         self.last_heartbeat_t = 0.0
         self.battery_mv = 0
 
+        # Ack tracking (for verifying commands reach the robot)
+        self._last_ack_cmd = ""
+        self._ack_event = threading.Event()
+        self._robot_pong = threading.Event()
+
     # -- lifecycle --
 
     def start(self) -> None:
@@ -242,7 +268,9 @@ class SimpleRobotClient:
 
     def send(self, cmd: Dict) -> bool:
         try:
-            payload = json.dumps(cmd).encode()
+            # Use compact separators (no spaces) so the ESP32 bridge's
+            # strstr() checks match the JSON key/value pairs exactly.
+            payload = json.dumps(cmd, separators=(',', ':')).encode()
             self._sock.sendto(payload, (self.ip, self.port))
             self._sequence += 1
             return True
@@ -253,6 +281,14 @@ class SimpleRobotClient:
     def ping(self) -> bool:
         return self.send({
             "cmd": "ping",
+            "seq": self._sequence,
+            "ts": int(time.time() * 1000),
+        })
+
+    def bridge_ping(self) -> bool:
+        """Ping the ESP32 bridge directly (no UART forwarding to robot)."""
+        return self.send({
+            "cmd": "bridge_ping",
             "seq": self._sequence,
             "ts": int(time.time() * 1000),
         })
@@ -280,35 +316,112 @@ class SimpleRobotClient:
         self._pmove_result = None
         return self.send(cmd)
 
+    def line_follow(self, speed_pct: int,
+                    distance_mm: float = 0, duration_ms: int = 0,
+                    search_mm: float = 0) -> bool:
+        """Start a line-follow move using the front IR sensors for tracking.
+
+        The robot must have been calibrated first (calibrate_line_sensors).
+        Completion is signalled by an lf_done message -- use wait_for_pmove()
+        which also listens for lf_done.
+
+        If *search_mm* > 0, the robot first drives slowly forward up to that
+        distance looking for the line.  PID tracking only starts once the
+        line is confidently detected.  This is essential after U-turns where
+        the robot may not be perfectly centred on the next track.
+        """
+        cmd: Dict = {
+            "cmd": "linefollow",
+            "speed": max(1, min(100, speed_pct)),
+        }
+        if distance_mm > 0:
+            cmd["dist"] = int(distance_mm)
+        elif duration_ms > 0:
+            cmd["dur"] = duration_ms
+        else:
+            return False
+        if search_mm > 0:
+            cmd["search"] = int(search_mm)
+        self._pmove_done.clear()
+        self._pmove_result = None
+        return self.send(cmd)
+
     def wait_for_pmove(self, timeout: float = 30.0) -> Optional[Dict]:
         if self._pmove_done.wait(timeout):
             return self._pmove_result
         self.logger.warning("pmove timed out (%.1fs)", timeout)
         return None
 
+    def set_heading(self, heading_deg: float) -> bool:
+        """Set the robot's heading to a specific value (corrects gyro drift)."""
+        return self.send({"cmd": "setheading", "h": int(heading_deg)})
+
     def calibrate_line_sensors(self) -> bool:
         return self.send({"cmd": "calibrate", "sensor": "line"})
 
     def wait_for_connection(self, timeout: float = 5.0) -> bool:
-        self.ping()
+        """Block until a response arrives from the bridge.
+
+        Sends bridge_ping (handled by the ESP32 itself, does NOT depend
+        on the 3pi+ robot UART) and retries every 0.5 s.
+        """
+        self.bridge_ping()
         deadline = time.time() + timeout
+        next_ping = time.time() + 0.5
         while time.time() < deadline:
             if self.is_connected:
                 return True
+            if time.time() >= next_ping:
+                self.bridge_ping()
+                next_ping = time.time() + 0.5
             time.sleep(0.05)
         return self.is_connected
+
+    def verify_robot(self, timeout: float = 3.0) -> bool:
+        """Verify that the 3pi+ robot is reachable through the UART bridge.
+
+        Sends a regular 'ping' (forwarded by the ESP32 to the robot via
+        UART) and waits for the 'pong' response -- proving the full
+        WiFi -> ESP32 -> UART -> 3pi+ -> UART -> ESP32 -> WiFi path.
+        """
+        self._robot_pong.clear()
+        self.ping()
+        deadline = time.time() + timeout
+        next_ping = time.time() + 0.8
+        while time.time() < deadline:
+            if self._robot_pong.wait(timeout=0.1):
+                return True
+            if time.time() >= next_ping:
+                self.ping()
+                next_ping = time.time() + 0.8
+        return False
+
+    def wait_for_ack(self, cmd: str, timeout: float = 5.0) -> bool:
+        """Wait until the robot sends an ack for *cmd*."""
+        self._ack_event.clear()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._ack_event.wait(timeout=0.1):
+                if self._last_ack_cmd == cmd:
+                    return True
+                self._ack_event.clear()
+        return False
 
     # -- receive --
 
     def _rx_loop(self) -> None:
         while self._running:
             try:
-                data, _ = self._sock.recvfrom(2048)
-                msg = json.loads(data.decode())
+                data, addr = self._sock.recvfrom(2048)
+                raw = data.decode()
+                self.logger.debug("RX from %s: %s", addr, raw[:200])
+                msg = json.loads(raw)
                 self._dispatch(msg)
             except socket.timeout:
                 continue
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.logger.debug("RX decode error: %s  data=%r",
+                                  exc, data[:100] if data else b"")
                 continue
             except OSError:
                 break
@@ -332,17 +445,62 @@ class SimpleRobotClient:
             self.logger.info("pmove_done: dist=%.1f  pos=(%.1f, %.1f)",
                              msg.get("dist", 0),
                              pos.get("x", 0), pos.get("y", 0))
+        elif msg_type == "lf_done":
+            pos = msg.get("pos", {})
+            self._update_position(pos.get("x", 0), pos.get("y", 0),
+                                  pos.get("h", 0))
+            self._pmove_result = msg
+            self._pmove_done.set()
+            reason = msg.get("reason", "complete")
+            self.logger.info("lf_done (%s): dist=%.1f  pos=(%.1f, %.1f)",
+                             reason, msg.get("dist", 0),
+                             pos.get("x", 0), pos.get("y", 0))
+        elif msg_type == "lf_status":
+            # Periodic line-follow telemetry -- update position
+            pos = msg.get("pos", {})
+            if pos:
+                self._update_position(pos.get("x", 0), pos.get("y", 0),
+                                      pos.get("h", 0))
+            self.logger.info("lf_status: line=%d err=%d sns=%s spd=%s "
+                             "dist=%.1f h=%.1f",
+                             msg.get("line", 0), msg.get("err", 0),
+                             msg.get("sns", []),
+                             msg.get("spd", []), msg.get("dist", 0),
+                             pos.get("h", 0))
         elif msg_type == "heartbeat":
             self.battery_mv = msg.get("battery", 0)
+        elif msg_type == "bridge_status":
+            self.logger.debug("Bridge status: IP=%s RSSI=%s heap=%s",
+                              msg.get("ip", "?"), msg.get("rssi", "?"),
+                              msg.get("heap", "?"))
+        elif msg_type == "bridge_pong":
+            client_ts = msg.get("client_ts", 0)
+            now_ms = int(time.time() * 1000)
+            rtt = now_ms - client_ts if client_ts else 0
+            self.logger.debug("Bridge pong: RTT=%d ms", rtt)
+        elif msg_type == "ack":
+            self._last_ack_cmd = msg.get("cmd", "")
+            self._ack_event.set()
+            self.logger.debug("Ack: cmd=%s", self._last_ack_cmd)
         elif msg_type == "pong":
             client_ts = msg.get("client_ts", 0)
             rtt = int(time.time() * 1000) - client_ts if client_ts else 0
             self.logger.debug("Pong RTT=%d ms", rtt)
+            self._robot_pong.set()
         elif msg_type == "event":
             event = msg.get("event", "")
             if event == "bump":
                 self.logger.warning("BUMP %s -- motors stopped",
                                     msg.get("side", ""))
+            elif event == "search_ok":
+                self.logger.info("Line search: found at %.1f mm",
+                                 msg.get("d", 0))
+            elif event == "line_lost":
+                self.logger.warning("Line lost (sensors below threshold)")
+            elif event == "line_found":
+                self.logger.info("Line re-acquired")
+            else:
+                self.logger.info("Event: %s", event)
         elif msg_type == "error":
             self.logger.warning("Robot error: %s", msg.get("error", "?"))
 
@@ -640,9 +798,11 @@ class SerpentineDriveExecutor:
     """
 
     def __init__(self, robot: SimpleRobotClient,
-                 speed_pct: int = DEFAULT_DRIVE_SPEED_PCT):
+                 speed_pct: int = DEFAULT_DRIVE_SPEED_PCT,
+                 use_line_follow: bool = True):
         self.robot = robot
         self.speed_pct = speed_pct
+        self.use_line_follow = use_line_follow
         self.logger = logging.getLogger("drive")
         self._thread: Optional[threading.Thread] = None
         self._abort = threading.Event()
@@ -662,17 +822,70 @@ class SerpentineDriveExecutor:
 
         self.logger.info("=== Serpentine drive starting ===")
 
+        # ---- Pre-flight: verify robot is reachable via UART ----
+        self.logger.info("Verifying robot UART link (ping -> pong) ...")
+        if not robot.verify_robot(timeout=4.0):
+            self.logger.error(
+                "Robot is NOT responding via UART!\n"
+                "  The ESP32 bridge is reachable, but the 3pi+ robot\n"
+                "  did not reply to a forwarded ping.\n"
+                "  Check:\n"
+                "    1. 3pi+ is powered on (green power LED)\n"
+                "    2. UART wiring: ESP32 GPIO5 <-> 3pi+ Pin 0,\n"
+                "                    ESP32 GPIO4 <-> 3pi+ Pin 1,\n"
+                "                    GND <-> GND\n"
+                "    3. 3pi+ firmware is flashed (pio run -e pololu-3pi -t upload)")
+            return
+        self.logger.info("Robot UART link OK (battery %d mV)", robot.battery_mv)
+
         # Reset odometry
         robot.reset_position()
+        if not robot.wait_for_ack("resetpos", timeout=2.0):
+            self.logger.warning("No ack for resetpos (continuing)")
+        time.sleep(0.2)
+
+        # Calibrate line sensors before driving if using line-follow
+        if self.use_line_follow:
+            cal_ok = False
+            for attempt in range(3):
+                self.logger.info("Calibrating line sensors (robot will spin)"
+                                 " ... [attempt %d/3]", attempt + 1)
+                robot.calibrate_line_sensors()
+                if robot.wait_for_ack("calibrate", timeout=5.0):
+                    self.logger.info(
+                        "Line sensor calibration confirmed by robot")
+                    cal_ok = True
+                    break
+                self.logger.warning(
+                    "No ack for calibrate (attempt %d/3)", attempt + 1)
+                time.sleep(0.5)
+            if not cal_ok:
+                self.logger.error(
+                    "Calibration failed after 3 attempts.  Check UART "
+                    "wiring and try running with -v for diagnostics.")
+                return
+
+        # The firmware resets heading + position after calibration, so
+        # no separate resetpos needed.  Sync heading from robot:
         time.sleep(0.3)
+        self._poll_position()
 
         # Build waypoints
         waypoints = build_serpentine_waypoints()
         self.logger.info("Waypoints: %d", len(waypoints))
 
-        current_x = START_X
+        # IMPORTANT: Waypoints are in board coordinates (mm from board corner).
+        # The robot's encoder odometry is in its *own* local frame (0,0 at
+        # power-on/reset) and will drift.  We CANNOT compare robot odometry
+        # x/y against board waypoints.  Instead we use the *planned* board
+        # position (we know where on the board the robot is after each
+        # commanded segment) and only read the robot's gyro heading (which
+        # is corrected after each segment via setheading).
+        current_x = START_X   # planned board position
         current_y = START_Y
-        current_h = 0.0  # heading in degrees (0 = facing +X = right)
+        current_h = 0.0       # nominal heading after calibration reset
+        self.logger.info("Start pose: planned=(%.1f, %.1f) h=%.1f",
+                         current_x, current_y, current_h)
 
         for idx, wp in enumerate(waypoints):
             if self._abort.is_set():
@@ -704,37 +917,80 @@ class SerpentineDriveExecutor:
 
                 if abs(heading_diff) > 5.0:
                     self._point_turn(heading_diff)
+                    time.sleep(0.2)
+                    # Correct heading to expected after turn
+                    robot.set_heading(need_heading)
+                    time.sleep(0.15)
                     current_h = need_heading
 
-                # Drive straight
-                self.logger.info("  Straight %.1f mm  heading=%.1f",
-                                 dist, current_h)
-                robot.precision_move("w", self.speed_pct,
-                                     distance_mm=dist)
+                # Drive straight -- use line-follow if enabled
+                self.logger.info("  Straight %.1f mm  heading=%.1f  mode=%s",
+                                 dist, current_h,
+                                 "line-follow" if self.use_line_follow
+                                 else "pmove")
+                if self.use_line_follow:
+                    robot.line_follow(self.speed_pct, distance_mm=dist,
+                                      search_mm=200)
+                else:
+                    robot.precision_move("w", self.speed_pct,
+                                        distance_mm=dist)
                 result = robot.wait_for_pmove(60.0)
                 if result is None:
-                    self.logger.error("  pmove timeout -- aborting leg")
-                    continue
+                    self.logger.error("  Move timeout -- stopping robot")
+                    robot.send({"cmd": "stop"})
+                    time.sleep(0.3)
+                elif result.get("reason") == "no_line":
+                    self.logger.error("  Line not found during search -- "
+                                      "stopping")
+                    robot.send({"cmd": "stop"})
+                    time.sleep(0.3)
 
-                # Update current pose from robot
-                self._poll_position()
-                current_x = robot.x_mm
-                current_y = robot.y_mm
-                current_h = robot.heading_deg
+                # CRITICAL: Correct gyro heading after line-follow.
+                # During line-follow the PID steers via differential motors,
+                # but the gyro heading drifts freely and becomes unreliable.
+                # Set it back to the expected value so U-turns work.
+                robot.set_heading(need_heading)
+                time.sleep(0.15)
+                current_h = need_heading
 
             else:
                 # ------- U-turn (vertical transition between tracks) -------
-                # Strategy: turn 90 deg toward next track, drive dist, turn 90 deg
-                turn_dir = 90.0 if dy > 0 else -90.0
+                # Compute absolute target headings for each step of the
+                # turn instead of using fixed +/-90 relative turns.
+                vert_heading = 90.0 if dy > 0 else -90.0
                 vert_dist = abs(dy)
 
-                self.logger.info("  U-turn: turn %.0f deg, fwd %.1f mm, "
-                                 "turn %.0f deg", turn_dir, vert_dist,
-                                 -turn_dir)
+                # Determine next horizontal heading by looking ahead
+                next_pass_idx = idx + 1
+                if next_pass_idx < len(waypoints):
+                    next_dx = waypoints[next_pass_idx].x_mm - wp.x_mm
+                    next_heading = 0.0 if next_dx > 0 else 180.0
+                else:
+                    next_heading = current_h
 
-                # First 90-degree turn
-                self._point_turn(turn_dir)
-                current_h += turn_dir
+                # Compute turn deltas from absolute headings
+                turn1 = vert_heading - current_h
+                while turn1 > 180:
+                    turn1 -= 360
+                while turn1 < -180:
+                    turn1 += 360
+
+                turn2 = next_heading - vert_heading
+                while turn2 > 180:
+                    turn2 -= 360
+                while turn2 < -180:
+                    turn2 += 360
+
+                self.logger.info(
+                    "  U-turn: turn %.0f->%.0f (%.0f deg), fwd %.1f mm, "
+                    "turn %.0f->%.0f (%.0f deg)",
+                    current_h, vert_heading, turn1,
+                    vert_dist,
+                    vert_heading, next_heading, turn2)
+
+                # First turn (toward vertical)
+                self._point_turn(turn1)
+                robot.set_heading(vert_heading)
                 time.sleep(0.2)
 
                 # Drive the vertical segment
@@ -743,18 +999,20 @@ class SerpentineDriveExecutor:
                 result = robot.wait_for_pmove(30.0)
                 time.sleep(0.2)
 
-                # Second 90-degree turn (back to horizontal)
-                self._point_turn(-turn_dir)
-                current_h -= turn_dir
+                # Second turn (toward next horizontal direction)
+                self._point_turn(turn2)
+                robot.set_heading(next_heading)
                 time.sleep(0.2)
+                current_h = next_heading
 
-                self._poll_position()
-                current_x = robot.x_mm
-                current_y = robot.y_mm
-                current_h = robot.heading_deg
+            # Advance planned position to the target waypoint (board coords).
+            self._poll_position()
+            current_x = wp.x_mm
+            current_y = wp.y_mm
 
-            self.logger.info("  Arrived pos=(%.1f, %.1f) h=%.1f",
-                             current_x, current_y, current_h)
+            self.logger.info("  Arrived planned=(%.1f, %.1f) odom=(%.1f, %.1f) h=%.1f",
+                             current_x, current_y,
+                             robot.x_mm, robot.y_mm, current_h)
             time.sleep(0.3)  # brief pause between segments
 
         self.logger.info("=== Serpentine drive complete ===")
@@ -765,17 +1023,17 @@ class SerpentineDriveExecutor:
         """Rotate in place by *degrees* (positive = CCW, a-turn;
         negative = CW, d-turn).
 
-        Uses a timed move since the 3pi+ pmove doesn't support pure rotation.
-        Empirical: at speed 40%, ~800 ms per 90 deg on hard surface.
+        Uses encoder-distance-based moves.  For the 3pi+ with ~96 mm
+        wheel track, a 90-degree turn requires each wheel to travel
+        ~75.4 mm of arc.  Scale linearly for other angles.
         """
         if abs(degrees) < 1.0:
             return
         direction = "a" if degrees > 0 else "d"
-        # Scale duration linearly with angle
-        dur_ms = int(abs(degrees) / 90.0 * 800)
-        self.logger.debug("  Point turn: %s for %d ms (%.0f deg)",
-                          direction, dur_ms, degrees)
-        self.robot.precision_move(direction, 40, duration_ms=dur_ms)
+        arc_mm = TURN_90_ARC_MM * abs(degrees) / 90.0
+        self.logger.debug("  Point turn: %s dist=%.1f mm (%.0f deg)",
+                          direction, arc_mm, degrees)
+        self.robot.precision_move(direction, 40, distance_mm=arc_mm)
         self.robot.wait_for_pmove(10.0)
 
     def _poll_position(self) -> None:
@@ -823,6 +1081,8 @@ def main() -> None:
                         help="Show the track visualization without a robot")
     parser.add_argument("--no-drive", action="store_true",
                         help="Connect but do not auto-drive (manual control)")
+    parser.add_argument("--no-line-follow", action="store_true",
+                        help="Use dead-reckoning pmove instead of line-follow")
     parser.add_argument("--speed", type=int, default=DEFAULT_DRIVE_SPEED_PCT,
                         help="Straight-leg speed percent (default 50)")
     parser.add_argument("--log", default=None,
@@ -868,15 +1128,51 @@ def main() -> None:
         robot.start()
 
         if not robot.wait_for_connection(5.0):
-            logger.error("No response from bridge -- check that the ESP32-C3 "
-                         "is powered and on the same network.")
+            # Show local network info to help diagnose subnet mismatches
+            diag = ""
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect((ip, port))
+                local_ip = s.getsockname()[0]
+                s.close()
+                diag = f"  Local IP reaching bridge: {local_ip}"
+            except Exception:
+                diag = "  (could not determine local IP toward bridge)"
+            logger.error(
+                "No response from bridge at %s:%d after 5 s.\n%s\n"
+                "  Troubleshooting:\n"
+                "    1. Verify the ESP32-C3 LED blinked 3x on boot (WiFi OK)\n"
+                "    2. Confirm this PC and the ESP32 are on the SAME subnet\n"
+                "    3. Try:  nc -u %s %d   then type {\"cmd\":\"bridge_ping\"}\n"
+                "    4. Check firewall:  sudo iptables -L -n | grep -i drop\n"
+                "    5. Run with -v for packet-level debug logging",
+                ip, port, diag, ip, port)
             robot.stop()
             sys.exit(1)
 
-        logger.info("Bridge connected (battery %d mV)", robot.battery_mv)
+        logger.info("Bridge connected")
+
+        # Quick robot UART check (non-blocking, just advisory)
+        logger.info("Checking robot UART path ...")
+        if robot.verify_robot(timeout=3.0):
+            logger.info("Robot responding (battery %d mV)", robot.battery_mv)
+        else:
+            logger.warning(
+                "Robot did NOT respond to ping via UART.  "
+                "The ESP32 bridge is working, but the 3pi+ robot "
+                "may not be powered or wired correctly.")
+            if not args.no_drive:
+                logger.error("Cannot drive without a responding robot. "
+                             "Use --no-drive to just visualize.")
+                robot.stop()
+                sys.exit(1)
 
         if not args.no_drive:
-            executor = SerpentineDriveExecutor(robot, speed_pct=drive_speed)
+            executor = SerpentineDriveExecutor(
+                robot,
+                speed_pct=drive_speed,
+                use_line_follow=not args.no_line_follow,
+            )
             executor.start()
 
     # Launch visualization (blocks until window closed)
