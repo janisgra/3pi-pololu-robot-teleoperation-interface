@@ -22,10 +22,10 @@ The ATmega32U4's Serial1 (pins 0/1) is shared between the display and UART commu
 ## Overview
 
 ```
-┌──────────────────┐      WiFi/UDP      ┌───────────────┐      UART      ┌─────────────────┐
-│  Python Script   │ ◄──────────────────► │  ESP32 Bridge  │ ◄────────────► │  3pi+ 32U4 Robot │
-│  or your backend │      JSON msgs      │  (S3 or C3)    │   115200 baud │  ATmega32U4      │
-└──────────────────┘                     └───────────────┘                └─────────────────┘
+┌──────────────────┐      WiFi/UDP        ┌───────────────┐      UART      ┌──────────────────┐
+│  Python Script   │ ◄──────────────────► │  ESP32 Bridge │ ◄────────────► │  3pi+ 32U4 Robot │
+│  or your backend │      JSON msgs       │  (S3 or C3)   │   115200 baud  │  ATmega32U4      │
+└──────────────────┘                      └───────────────┘                └──────────────────┘
 ```
 
 The system consists of three components:
