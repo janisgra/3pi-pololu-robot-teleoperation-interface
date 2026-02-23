@@ -30,7 +30,7 @@
 #define WIFI_PASSWORD           "goodlife"
 
 // UDP Configuration
-#define UDP_PORT                5005
+#define UDP_PORT                5006
 #define DISCOVERY_PORT          5004    // Broadcast beacon port for auto-discovery
 #define DISCOVERY_INTERVAL_MS   2000    // Beacon interval when no client connected
 #define DISCOVERY_SLOW_MS       10000   // Beacon interval when client is active

@@ -108,7 +108,7 @@ Edit WiFi credentials in the ESP32 bridge source:
 ```bash
 cd tools
 pip install pynput  # Optional, for real-time keyboard control
-python robot_controller.py --ip 192.168.7.210 --port 5005
+python robot_controller.py --ip 192.168.7.210 --port 5006
 ```
 
 Controls:
@@ -126,7 +126,7 @@ from robot_controller import RobotController
 import time
 
 # Create controller
-robot = RobotController(target_ip="192.168.7.210", target_port=5005)
+robot = RobotController(target_ip="192.168.7.210", target_port=5006)
 
 # Basic movement
 robot.move(200, 200, duration=1000)  # Forward 1 second
@@ -149,7 +149,7 @@ robot.stop()
 
 ## JSON Protocol
 
-All communication uses JSON over UDP (port 5005).
+All communication uses JSON over UDP (port 5006).
 
 ### Commands (Controller → Robot)
 

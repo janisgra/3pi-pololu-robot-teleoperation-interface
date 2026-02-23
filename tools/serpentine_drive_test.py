@@ -69,7 +69,7 @@ START_Y = Y_MIN                        # 112.5
 # ---------------------------------------------------------------------------
 
 DEFAULT_ROBOT_IP = "192.168.7.210"
-DEFAULT_ROBOT_PORT = 5005
+DEFAULT_ROBOT_PORT = 5006
 DISCOVERY_PORT = 5004
 SOCKET_TIMEOUT = 0.1
 

@@ -7,7 +7,7 @@ Communication protocol between the control server and the 3pi+ robot via ESP32 W
 | Property | Value |
 |----------|-------|
 | Transport | JSON over UDP |
-| Port | 5005 |
+| Port | 5006 |
 | Direction | Bidirectional |
 | Baud Rate | 115200 (ESP32 ↔ Robot) |
 

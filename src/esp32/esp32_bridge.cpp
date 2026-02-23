@@ -30,7 +30,7 @@
 #define WIFI_PASSWORD           "goodlife"
 
 // UDP Configuration
-#define UDP_PORT                5005
+#define UDP_PORT                5006
 
 // Pin Configuration (ESP32-S3-WROOM-1)
 #define ROBOT_RX_PIN            18      // GPIO18 <- 3pi+ Pin 0 (TX1)
