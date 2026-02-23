@@ -64,7 +64,7 @@ using namespace Pololu3piPlus32U4;
 #define LINE_SEARCH_THRESHOLD   500     // sensor sum to confirm line during search
 #define LINE_SEARCH_SPEED       80      // motor speed during search phase
 #define LINE_REPORT_INTERVAL_MS 250     // how often to stream line telemetry
-#define CALIBRATION_SPEED       40      // motor speed during calibration spin
+#define CALIBRATION_SPEED       55      // motor speed during calibration spin
 
 // Timing
 #define HEARTBEAT_INTERVAL_MS   2000

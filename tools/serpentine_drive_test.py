@@ -82,6 +82,45 @@ POSITION_POLL_HZ = 10          # how often to request position from robot
 WHEEL_TRACK_MM = 96.0          # approximate distance between wheel centres
 TURN_90_ARC_MM = (WHEEL_TRACK_MM / 2) * (math.pi / 2)  # ~75.4 mm encoder dist
 
+# U-turn smooth-arc parameters (empirically tuned on test board)
+# The robot traces a smooth semicircular arc instead of sharp
+# point-turn + forward + point-turn.  Each step is a short forward
+# followed by a small in-place turn.
+# Left and right U-turns have separate tuning.
+UTURN_LEFT_STEPS = 5             # fwd+turn iterations for LEFT U-turn
+UTURN_LEFT_FWD_MM = 25.0         # forward distance per step (mm)
+UTURN_LEFT_TURN_DEG = 16.0       # turn angle per step (degrees)
+UTURN_LEFT_EXTRA_FWD_MM = 15.0   # extra forward after arc completes
+
+UTURN_RIGHT_STEPS = 5            # fwd+turn iterations for RIGHT U-turn
+UTURN_RIGHT_FWD_MM = 25.0        # forward distance per step (mm)
+UTURN_RIGHT_TURN_DEG = 16.0      # turn angle per step (degrees)
+UTURN_RIGHT_EXTRA_DEG = 0.0      # extra CW correction after right arc
+UTURN_RIGHT_EXTRA_FWD_MM = 15.0  # extra forward after arc completes
+
+UTURN_ARC_FWD_SPEED_PCT = 30     # % speed for arc forward segments
+UTURN_ARC_TURN_SPEED_PCT = 40    # % speed for arc turn segments
+
+# Line-follow distances (empirical -- tape is shorter than board geometry)
+LF_STRAIGHT_DIST_MM = 720.0      # tape length between U-turns
+LF_SEARCH_MM = 200.0             # search distance when acquiring line
+
+# Return path parameters (exterior return along board left edge)
+# The return path consists of:
+#   1. Approach leg:  continue along last track from X_MIN to START_X
+#   2. Arc 1:         quarter-circle LEFT arc (heading 180 -> -90)
+#   3. Straight leg:  corridor at X = MARGIN_MM from Y ~562 to Y ~162
+#   4. Arc 2:         quarter-circle LEFT arc (heading -90  -> 0)
+# Arc tuning from empirical tests: 3 x (fwd 38 mm + left 12 deg) ~ 90 deg.
+RETURN_ARC_STEPS = 3              # fwd+turn iterations per quarter-circle
+RETURN_ARC_FWD_MM = 38.0          # forward distance per step (mm)
+RETURN_ARC_TURN_DEG = 12.0        # left-turn angle per step (degrees)
+RETURN_CORRIDOR_X = MARGIN_MM     # 100 mm -- X position of the return corridor
+RETURN_APPROACH_DIST_MM = X_MIN - START_X   # 100 mm approach to arc 1 entry
+RETURN_STRAIGHT_DIST_MM = (                 # ~400 mm corridor between arcs
+    (TRACK_YS[-1] - UTURN_RADIUS_MM) - (TRACK_YS[0] + UTURN_RADIUS_MM)
+)
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -653,13 +692,16 @@ class SerpentineVisualizer:
         def update(frame):
             if self.robot:
                 with self.robot._traj_lock:
-                    self._plot_xs = [r.x_mm for r in self.robot.trajectory]
-                    self._plot_ys = [r.y_mm for r in self.robot.trajectory]
+                    self._plot_xs = [r.x_mm + START_X
+                                     for r in self.robot.trajectory]
+                    self._plot_ys = [r.y_mm + START_Y
+                                     for r in self.robot.trajectory]
 
                 traj_line.set_data(self._plot_xs, self._plot_ys)
 
                 with self.robot._odom_lock:
-                    cx, cy = self.robot.x_mm, self.robot.y_mm
+                    cx = self.robot.x_mm + START_X
+                    cy = self.robot.y_mm + START_Y
                     ch = self.robot.heading_deg
 
                 pos_marker.set_data([cx], [cy])
@@ -851,7 +893,7 @@ class SerpentineDriveExecutor:
                 self.logger.info("Calibrating line sensors (robot will spin)"
                                  " ... [attempt %d/3]", attempt + 1)
                 robot.calibrate_line_sensors()
-                if robot.wait_for_ack("calibrate", timeout=5.0):
+                if robot.wait_for_ack("calibrate", timeout=10.0):
                     self.logger.info(
                         "Line sensor calibration confirmed by robot")
                     cal_ok = True
@@ -924,13 +966,15 @@ class SerpentineDriveExecutor:
                     current_h = need_heading
 
                 # Drive straight -- use line-follow if enabled
+                lf_dist = LF_STRAIGHT_DIST_MM if self.use_line_follow else dist
                 self.logger.info("  Straight %.1f mm  heading=%.1f  mode=%s",
-                                 dist, current_h,
+                                 lf_dist, current_h,
                                  "line-follow" if self.use_line_follow
                                  else "pmove")
                 if self.use_line_follow:
-                    robot.line_follow(self.speed_pct, distance_mm=dist,
-                                      search_mm=200)
+                    robot.line_follow(self.speed_pct,
+                                      distance_mm=lf_dist,
+                                      search_mm=LF_SEARCH_MM)
                 else:
                     robot.precision_move("w", self.speed_pct,
                                         distance_mm=dist)
@@ -954,13 +998,27 @@ class SerpentineDriveExecutor:
                 current_h = need_heading
 
             else:
-                # ------- U-turn (vertical transition between tracks) -------
-                # Compute absolute target headings for each step of the
-                # turn instead of using fixed +/-90 relative turns.
-                vert_heading = 90.0 if dy > 0 else -90.0
-                vert_dist = abs(dy)
+                # ------- U-turn (smooth arc) -------
+                # Trace a smooth arc: repeat (fwd + small turn) N times.
+                # Direction depends on current heading:
+                #   heading ~0   (was going right) -> LEFT  U-turn (CCW)
+                #   heading ~180 (was going left)  -> RIGHT U-turn (CW)
+                turn_left = (abs(current_h) < 90)
+                turn_dir = "a" if turn_left else "d"
 
-                # Determine next horizontal heading by looking ahead
+                # Select per-direction parameters
+                if turn_left:
+                    n_steps = UTURN_LEFT_STEPS
+                    step_fwd = UTURN_LEFT_FWD_MM
+                    step_deg = UTURN_LEFT_TURN_DEG
+                    extra_fwd = UTURN_LEFT_EXTRA_FWD_MM
+                else:
+                    n_steps = UTURN_RIGHT_STEPS
+                    step_fwd = UTURN_RIGHT_FWD_MM
+                    step_deg = UTURN_RIGHT_TURN_DEG
+                    extra_fwd = UTURN_RIGHT_EXTRA_FWD_MM
+
+                # Determine heading for the NEXT straight leg
                 next_pass_idx = idx + 1
                 if next_pass_idx < len(waypoints):
                     next_dx = waypoints[next_pass_idx].x_mm - wp.x_mm
@@ -968,39 +1026,40 @@ class SerpentineDriveExecutor:
                 else:
                     next_heading = current_h
 
-                # Compute turn deltas from absolute headings
-                turn1 = vert_heading - current_h
-                while turn1 > 180:
-                    turn1 -= 360
-                while turn1 < -180:
-                    turn1 += 360
-
-                turn2 = next_heading - vert_heading
-                while turn2 > 180:
-                    turn2 -= 360
-                while turn2 < -180:
-                    turn2 += 360
-
                 self.logger.info(
-                    "  U-turn: turn %.0f->%.0f (%.0f deg), fwd %.1f mm, "
-                    "turn %.0f->%.0f (%.0f deg)",
-                    current_h, vert_heading, turn1,
-                    vert_dist,
-                    vert_heading, next_heading, turn2)
+                    "  U-turn: %s arc (%d x [fwd %.0f mm + turn %.0f deg])"
+                    " + fwd %.0f mm%s",
+                    "LEFT" if turn_left else "RIGHT",
+                    n_steps, step_fwd, step_deg, extra_fwd,
+                    f" + extra {UTURN_RIGHT_EXTRA_DEG:.0f} deg"
+                    if not turn_left else "")
 
-                # First turn (toward vertical)
-                self._point_turn(turn1)
-                robot.set_heading(vert_heading)
-                time.sleep(0.2)
+                arc_mm = TURN_90_ARC_MM * step_deg / 90.0
+                for step in range(n_steps):
+                    # Forward segment
+                    robot.precision_move("w", UTURN_ARC_FWD_SPEED_PCT,
+                                         distance_mm=step_fwd)
+                    robot.wait_for_pmove(10.0)
+                    # Turn segment
+                    robot.precision_move(turn_dir, UTURN_ARC_TURN_SPEED_PCT,
+                                         distance_mm=arc_mm)
+                    robot.wait_for_pmove(10.0)
 
-                # Drive the vertical segment
-                robot.precision_move("w", UTURN_SPEED_PCT,
-                                     distance_mm=vert_dist)
-                result = robot.wait_for_pmove(30.0)
-                time.sleep(0.2)
+                # Right U-turns need a small extra correction
+                if not turn_left and UTURN_RIGHT_EXTRA_DEG > 0:
+                    extra_arc = (TURN_90_ARC_MM
+                                 * UTURN_RIGHT_EXTRA_DEG / 90.0)
+                    robot.precision_move("d", UTURN_ARC_TURN_SPEED_PCT,
+                                         distance_mm=extra_arc)
+                    robot.wait_for_pmove(10.0)
 
-                # Second turn (toward next horizontal direction)
-                self._point_turn(turn2)
+                # Extra forward to clear the arc and reach the next tape
+                if extra_fwd > 0:
+                    robot.precision_move("w", UTURN_ARC_FWD_SPEED_PCT,
+                                         distance_mm=extra_fwd)
+                    robot.wait_for_pmove(10.0)
+
+                # Lock heading to the expected value for next straight
                 robot.set_heading(next_heading)
                 time.sleep(0.2)
                 current_h = next_heading
@@ -1014,6 +1073,101 @@ class SerpentineDriveExecutor:
                              current_x, current_y,
                              robot.x_mm, robot.y_mm, current_h)
             time.sleep(0.3)  # brief pause between segments
+
+        # ---- Return path: drive back to start position ----
+        # The return tape runs along the board left edge:
+        #   approach (last track to arc entry) -> quarter-arc 1 (180->-90)
+        #   -> straight corridor at X=100 -> quarter-arc 2 (-90->0)
+        if self._abort.is_set():
+            return
+
+        self.logger.info("=== Return path ===")
+        arc_mm = TURN_90_ARC_MM * RETURN_ARC_TURN_DEG / 90.0
+
+        # -- Step 1: Approach -- continue along last track to arc entry --
+        if RETURN_APPROACH_DIST_MM > 1.0:
+            self.logger.info("  Approach: %.1f mm along last track",
+                             RETURN_APPROACH_DIST_MM)
+            if self.use_line_follow:
+                robot.line_follow(self.speed_pct,
+                                  distance_mm=RETURN_APPROACH_DIST_MM,
+                                  search_mm=LF_SEARCH_MM)
+            else:
+                robot.precision_move("w", self.speed_pct,
+                                     distance_mm=RETURN_APPROACH_DIST_MM)
+            result = robot.wait_for_pmove(30.0)
+            if result is None:
+                self.logger.error("  Approach timeout")
+                robot.send({"cmd": "stop"})
+        robot.set_heading(180.0)
+        time.sleep(0.15)
+        current_h = 180.0
+        current_x = START_X  # 150
+
+        # -- Step 2: Arc 1 -- quarter-circle LEFT (heading 180 -> -90) --
+        # Moves from ~(150, 612.5) to ~(100, 562.5), radius 50 mm
+        self.logger.info(
+            "  Arc 1: %d x [fwd %.0f mm + left %.0f deg]",
+            RETURN_ARC_STEPS, RETURN_ARC_FWD_MM, RETURN_ARC_TURN_DEG)
+        for step in range(RETURN_ARC_STEPS):
+            if self._abort.is_set():
+                return
+            robot.precision_move("w", UTURN_ARC_FWD_SPEED_PCT,
+                                 distance_mm=RETURN_ARC_FWD_MM)
+            robot.wait_for_pmove(10.0)
+            robot.precision_move("a", UTURN_ARC_TURN_SPEED_PCT,
+                                 distance_mm=arc_mm)
+            robot.wait_for_pmove(10.0)
+
+        robot.set_heading(-90.0)
+        time.sleep(0.2)
+        current_h = -90.0
+        current_x = RETURN_CORRIDOR_X           # 100
+        current_y = TRACK_YS[-1] - UTURN_RADIUS_MM  # 562.5
+
+        # -- Step 3: Straight corridor -- X = 100, heading -90 --
+        # Drive from ~(100, 562.5) to ~(100, 162.5)
+        self.logger.info("  Corridor: %.1f mm at X=%.0f, heading -90",
+                         RETURN_STRAIGHT_DIST_MM, RETURN_CORRIDOR_X)
+        if self.use_line_follow:
+            robot.line_follow(self.speed_pct,
+                              distance_mm=RETURN_STRAIGHT_DIST_MM,
+                              search_mm=LF_SEARCH_MM)
+        else:
+            robot.precision_move("w", self.speed_pct,
+                                 distance_mm=RETURN_STRAIGHT_DIST_MM)
+        result = robot.wait_for_pmove(120.0)
+        if result is None:
+            self.logger.error("  Corridor drive timeout")
+            robot.send({"cmd": "stop"})
+
+        robot.set_heading(-90.0)
+        time.sleep(0.15)
+        current_y = TRACK_YS[0] + UTURN_RADIUS_MM   # 162.5
+
+        # -- Step 4: Arc 2 -- quarter-circle LEFT (heading -90 -> 0) --
+        # Moves from ~(100, 162.5) to ~(150, 112.5), radius 50 mm
+        self.logger.info(
+            "  Arc 2: %d x [fwd %.0f mm + left %.0f deg]",
+            RETURN_ARC_STEPS, RETURN_ARC_FWD_MM, RETURN_ARC_TURN_DEG)
+        for step in range(RETURN_ARC_STEPS):
+            if self._abort.is_set():
+                return
+            robot.precision_move("w", UTURN_ARC_FWD_SPEED_PCT,
+                                 distance_mm=RETURN_ARC_FWD_MM)
+            robot.wait_for_pmove(10.0)
+            robot.precision_move("a", UTURN_ARC_TURN_SPEED_PCT,
+                                 distance_mm=arc_mm)
+            robot.wait_for_pmove(10.0)
+
+        robot.set_heading(0.0)
+        time.sleep(0.2)
+        current_h = 0.0
+        current_x = START_X    # 150
+        current_y = START_Y    # 112.5
+        self._poll_position()
+        self.logger.info("  Back at start: planned=(%.1f, %.1f) h=%.1f",
+                         current_x, current_y, current_h)
 
         self.logger.info("=== Serpentine drive complete ===")
         self.logger.info("Total samples recorded: %d",
