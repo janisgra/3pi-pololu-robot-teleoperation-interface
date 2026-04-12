@@ -690,17 +690,19 @@ void processCommand(const char* json) {
         int16_t left = constrain(parseIntValue(json, "\"left\""), -MAX_SPEED, MAX_SPEED);
         int16_t right = constrain(parseIntValue(json, "\"right\""), -MAX_SPEED, MAX_SPEED);
         uint32_t duration = parseIntValue(json, "\"duration\"");
-        
+        uint32_t seq = (uint32_t)parseIntValue(json, "\"seq\"");
+
         motors.setSpeeds(left, right);
         currentLeftSpeed = left;
         currentRightSpeed = right;
         moveEndTime = duration > 0 ? millis() + duration : 0;
         moveActive = duration > 0;
-        
-        espSerial.print(F("{\"type\":\"ack\",\"cmd\":\"move\",\"set_l\":"));
-        espSerial.print(left);
-        espSerial.print(F(",\"set_r\":"));
-        espSerial.print(right);
+
+        // Minimal ack -- desktop only needs seq for RTT matching; set_l/set_r
+        // were just echoes of values it already knows and fit poorly in the
+        // 32u4 flash budget (~100% used).
+        espSerial.print(F("{\"type\":\"ack\",\"cmd\":\"move\",\"seq\":"));
+        espSerial.print(seq);
         espSerial.print(F(",\"ts\":"));
         espSerial.print(millis());
         espSerial.println(F("}"));
