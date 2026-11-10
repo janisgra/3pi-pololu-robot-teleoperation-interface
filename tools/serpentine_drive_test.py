@@ -121,6 +121,22 @@ RETURN_STRAIGHT_DIST_MM = (                 # ~400 mm corridor between arcs
     (TRACK_YS[-1] - UTURN_RADIUS_MM) - (TRACK_YS[0] + UTURN_RADIUS_MM)
 )
 
+
+def ms32() -> int:
+    """Millisecond counter for ping 'ts' fields that fits in a signed 32-bit int.
+
+    The robot (AVR, 32-bit long) and the ESP32 bridge both parse 'ts' as a
+    32-bit integer, so an epoch-millisecond value overflows and is echoed back
+    mangled.  Wraps every ~24.8 days; use rtt_ms() to subtract safely.
+    """
+    return int(time.monotonic() * 1000) & 0x7FFFFFFF
+
+
+def rtt_ms(client_ts: int) -> int:
+    """Round-trip time in ms for a 'ts' value produced by ms32()."""
+    return (ms32() - client_ts) & 0x7FFFFFFF
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -321,7 +337,7 @@ class SimpleRobotClient:
         return self.send({
             "cmd": "ping",
             "seq": self._sequence,
-            "ts": int(time.time() * 1000),
+            "ts": ms32(),
         })
 
     def bridge_ping(self) -> bool:
@@ -329,7 +345,7 @@ class SimpleRobotClient:
         return self.send({
             "cmd": "bridge_ping",
             "seq": self._sequence,
-            "ts": int(time.time() * 1000),
+            "ts": ms32(),
         })
 
     def reset_position(self) -> bool:
@@ -513,17 +529,14 @@ class SimpleRobotClient:
                               msg.get("ip", "?"), msg.get("rssi", "?"),
                               msg.get("heap", "?"))
         elif msg_type == "bridge_pong":
-            client_ts = msg.get("client_ts", 0)
-            now_ms = int(time.time() * 1000)
-            rtt = now_ms - client_ts if client_ts else 0
+            rtt = rtt_ms(msg.get("client_ts", 0))
             self.logger.debug("Bridge pong: RTT=%d ms", rtt)
         elif msg_type == "ack":
             self._last_ack_cmd = msg.get("cmd", "")
             self._ack_event.set()
             self.logger.debug("Ack: cmd=%s", self._last_ack_cmd)
         elif msg_type == "pong":
-            client_ts = msg.get("client_ts", 0)
-            rtt = int(time.time() * 1000) - client_ts if client_ts else 0
+            rtt = rtt_ms(msg.get("client_ts", 0))
             self.logger.debug("Pong RTT=%d ms", rtt)
             self._robot_pong.set()
         elif msg_type == "event":

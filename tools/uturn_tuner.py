@@ -19,12 +19,16 @@ import argparse
 import json
 import logging
 import math
-import readline  # enables arrow-key history in input()
 import socket
 import sys
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
+
+try:
+    import readline  # noqa: F401 -- arrow-key history in input() on Linux/macOS
+except ImportError:
+    pass  # Not available on Windows; the console already provides history
 
 # ---------------------------------------------------------------------------
 # Network constants (same as serpentine_drive_test.py)
@@ -165,13 +169,15 @@ class RobotClient:
             self.logger.error("Send failed: %s", exc)
             return False
 
+    # 'ts' must fit in a signed 32-bit int: the robot and bridge parse it as
+    # one, so an epoch-millisecond value would overflow.
     def bridge_ping(self):
         self.send({"cmd": "bridge_ping", "seq": self._seq,
-                   "ts": int(time.time() * 1000)})
+                   "ts": int(time.monotonic() * 1000) & 0x7FFFFFFF})
 
     def ping(self):
         self.send({"cmd": "ping", "seq": self._seq,
-                   "ts": int(time.time() * 1000)})
+                   "ts": int(time.monotonic() * 1000) & 0x7FFFFFFF})
 
     def wait_for_connection(self, timeout=5.0):
         self.bridge_ping()
