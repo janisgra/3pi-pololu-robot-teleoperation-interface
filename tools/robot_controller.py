@@ -8,7 +8,7 @@ Author: Janis
 Version: 1.0.0
 
 Usage:
-    Interactive:  python robot_controller.py --ip 192.168.7.210 --port 5005
+    Interactive:  python robot_controller.py --ip 192.168.7.210 --port 5006
     Programmatic: Import RobotController class and call methods directly
 
 Controls (interactive mode):
@@ -35,7 +35,7 @@ from typing import Optional, Callable
 
 # Network Configuration
 DEFAULT_IP = "192.168.7.210"
-DEFAULT_PORT = 5005
+DEFAULT_PORT = 5006
 SOCKET_TIMEOUT = 0.1
 
 # Motor Speed Presets (level 1-5)
@@ -108,7 +108,7 @@ class RobotController:
         
         Args:
             target_ip: ESP32 bridge IP address
-            target_port: UDP port (default 5005)
+            target_port: UDP port (default 5006)
             on_response: Optional callback for received messages
         """
         self.target_ip = target_ip
