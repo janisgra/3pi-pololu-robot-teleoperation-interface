@@ -374,15 +374,9 @@ void updatePrecisionMove() {
  * The robot drives forward along the black line using the 5 downward-facing
  * IR reflectance sensors for lateral PID correction.  Terminates by
  * distance (encoder counts) or duration, whichever is specified.
+ * Caller must check lineSensorsCalibrated first.
  */
 void startLineFollow(int16_t speedPercent, float distMM, uint32_t durMS) {
-    if (!lineSensorsCalibrated) {
-        // Refuse to line-follow without calibration -- the raw values
-        // would be meaningless.
-        espSerial.println(F("{\"type\":\"error\",\"error\":\"line_not_calibrated\"}"));
-        return;
-    }
-
     lineFollow.active = true;
     lineFollow.baseSpeed = constrain(speedPercent * MAX_SPEED / 100, 1, MAX_SPEED);
     lineFollow.useDistance = (distMM > 0);
@@ -828,8 +822,13 @@ void processCommand(const char* json) {
         // Line-follow move: drive forward using line sensors for correction
         // JSON: {"cmd":"linefollow","speed":50,"dist":800}
         //   or: {"cmd":"linefollow","speed":50,"dur":5000}
-        int16_t speed = constrain(parseIntValue(json, "\"speed\""), 1, 100);
-        if (speed == 0) speed = 50;
+        // speed is 1-100 %; missing or <= 0 defaults to 50.
+        // Refuse before touching the motors: raw sensor values are
+        // meaningless without calibration.
+        if (!lineSensorsCalibrated) { sendError("line_not_calibrated"); return; }
+        int16_t speed = parseIntValue(json, "\"speed\"");
+        if (speed <= 0) speed = 50;
+        else if (speed > 100) speed = 100;
         float dist = parseIntValue(json, "\"dist\"");
         uint32_t dur = parseIntValue(json, "\"dur\"");
         if (dist <= 0 && dur <= 0) { sendError("no_dist_dur"); return; }
@@ -850,8 +849,6 @@ void processCommand(const char* json) {
         espSerial.print(speed);
         espSerial.print(dist > 0 ? F(",\"dist\":") : F(",\"dur\":"));
         espSerial.print(dist > 0 ? (int)dist : (int)dur);
-        espSerial.print(F(",\"calibrated\":"));
-        espSerial.print(lineSensorsCalibrated ? F("true") : F("false"));
         espSerial.print(F(",\"ts\":"));
         espSerial.print(millis());
         espSerial.println(F("}"));
@@ -928,7 +925,9 @@ void loop() {
     if (ledOffTime && now >= ledOffTime) { ledGreen(0); ledOffTime = 0; }
     if (commandCount > 0 && !ledOffTime) ledOffTime = now + 50;
     
-    if (moveActive && !precisionMove.active && now >= moveEndTime) {
+    // Timed 'move' expiry only.  pmove and linefollow also set moveActive
+    // but manage their own completion (and leave moveEndTime stale).
+    if (moveActive && !precisionMove.active && !lineFollow.active && now >= moveEndTime) {
         motors.setSpeeds(0, 0);
         currentLeftSpeed = currentRightSpeed = 0;
         moveActive = false;

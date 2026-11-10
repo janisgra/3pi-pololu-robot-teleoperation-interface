@@ -8,7 +8,7 @@ Author: Janis
 Version: 1.0.0
 
 Usage:
-    Interactive:  python robot_controller.py --ip 192.168.7.210 --port 5005
+    Interactive:  python robot_controller.py --ip 192.168.7.210 --port 5006
     Programmatic: Import RobotController class and call methods directly
 
 Controls (interactive mode):
